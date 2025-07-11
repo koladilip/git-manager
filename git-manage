@@ -1,0 +1,2849 @@
+#!/bin/bash
+
+# git-manage - A unified Git repository management tool
+# Usage: ./git-manage <command> [args...]
+
+set -e
+
+SCRIPT_NAME="git-manage"
+# Default organizations (can be multiple)
+DEFAULT_ORGS=()
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+show_usage() {
+    if is_workspace; then
+        show_workspace_usage
+    else
+        show_general_usage
+    fi
+}
+
+show_general_usage() {
+    local default_orgs_text=""
+    if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+        default_orgs_text=" (default orgs: ${DEFAULT_ORGS[*]})"
+    else
+        default_orgs_text=" (no default orgs set)"
+    fi
+    
+    cat << EOF
+Usage: $SCRIPT_NAME <command> [args...]
+
+🚀 Interactive Repository Management:
+
+  clone [org-name]
+    Interactive repository picker and cloner$default_orgs_text
+    Uses fzf for multi-select, shows repo details and stars
+
+📁 Workspace Management:
+
+  create <workspace-name>
+    Initialize a workspace folder with management scripts
+
+  install
+    Install git-manage to ~/.local/bin and add to PATH
+
+  config-orgs
+    Configure default organizations for autocomplete and defaults
+
+Examples:
+  $SCRIPT_NAME clone                    # Interactive picker
+  $SCRIPT_NAME clone microsoft          # Interactive picker (microsoft)
+  $SCRIPT_NAME create my-workspace      # Create workspace
+  $SCRIPT_NAME install                  # Install to PATH
+  $SCRIPT_NAME config-orgs              # Configure default orgs
+
+💡 Tip: Run commands inside a workspace for additional management features!
+EOF
+}
+
+show_workspace_usage() {
+    cat << EOF
+Usage: $SCRIPT_NAME <command> [args...]
+
+📦 You are in a workspace! Additional commands available:
+
+  clone [repo-name|org/repo|url] [org-name]
+    Clone repositories - supports multiple formats:
+    • repo-name              → first default org/repo-name
+    • org/repo-name          → org/repo-name  
+    • git@github.com:...     → full URL
+    • (no args)              → interactive picker
+
+  update
+    Update all repositories (pull latest from main/master)
+
+  sync
+    Sync repositories - check for changes and pull if needed
+
+  reset
+    Reset all repositories to base branches (discard local changes)
+
+  reset-and-sync
+    Reset all repositories to base branches, then sync (pull latest)
+
+  upgrade
+    Upgrade workspace with missing scripts (for existing workspaces)
+
+  setup-cron
+    Setup automatic updates every 6 hours
+
+  import-org [org-name]
+    Cache repository list from organization globally
+    Stores in ~/.git-manage/{org}/repos.txt for autocomplete & discovery
+
+  list-orgs
+    List all imported organizations and their repository counts
+
+  refresh-orgs
+    Refresh repository lists for all imported organizations
+
+  setup-org-cron
+    Setup automatic refresh of organization lists (daily)
+
+  select-repos [org-name]
+    Interactive repository selection from organization
+
+  config-orgs
+    Configure default organizations for autocomplete and defaults
+
+📁 Workspace Management:
+
+  create <workspace-name>
+    Create a new workspace (from any directory)
+
+  install
+    Install git-manage to ~/.local/bin
+
+Examples (in workspace):
+  $SCRIPT_NAME clone                    # Interactive picker
+  $SCRIPT_NAME clone repo-name          # Clone from default orgs
+  $SCRIPT_NAME clone microsoft/vscode   # Clone microsoft/vscode
+  $SCRIPT_NAME update                   # Update all repos
+  $SCRIPT_NAME sync                     # Sync repos (check before pull)
+  $SCRIPT_NAME reset                    # Reset repos to base branches
+  $SCRIPT_NAME reset-and-sync           # Reset then sync all repos
+  $SCRIPT_NAME upgrade                  # Upgrade workspace scripts
+  $SCRIPT_NAME import-org               # Import from default orgs
+EOF
+}
+
+# Check if required tools are installed
+check_dependencies() {
+    local deps=("$@")
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        log_info "Please install the missing tools:"
+        for dep in "${missing[@]}"; do
+            case "$dep" in
+                gh)
+                    log_info "  - GitHub CLI: brew install gh"
+                    ;;
+                fzf)
+                    log_info "  - fzf: brew install fzf"
+                    ;;
+                git)
+                    log_info "  - Git: brew install git"
+                    ;;
+            esac
+        done
+        exit 1
+    fi
+}
+
+# Check if user is authenticated with GitHub CLI
+check_gh_auth() {
+    if ! gh auth status &> /dev/null; then
+        log_error "Not authenticated with GitHub CLI"
+        log_info "Please run 'gh auth login' first"
+        exit 1
+    fi
+}
+
+# Get default branch from GitHub API
+get_default_branch() {
+    local repo_url="$1"
+    local repo_name="$2"
+    
+    # Extract org/repo from SSH URL
+    local org_repo=""
+    if [[ "$repo_url" == git@github.com:* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|git@github.com:||' | sed 's|\.git$||')
+    elif [[ "$repo_url" == https://github.com/* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|https://github.com/||' | sed 's|\.git$||')
+    else
+        # Fallback: cannot parse, return empty
+        return 1
+    fi
+    
+    # Check if we have a cached default branch
+    local org_name=$(echo "$org_repo" | cut -d'/' -f1)
+    local global_repos_file=$(get_global_org_repos "$org_name")
+    if [ -f "$global_repos_file" ]; then
+        local cached_branch=$(grep -F "$repo_url" "$global_repos_file" | cut -f2 2>/dev/null || echo "")
+        if [ -n "$cached_branch" ]; then
+            echo "$cached_branch"
+            return 0
+        fi
+    fi
+    
+    # Try to get default branch from GitHub API
+    local default_branch=""
+    if command -v gh &> /dev/null; then
+        # Add more robust error handling for the GitHub API call
+        default_branch=$(gh repo view "$org_repo" --json defaultBranchRef -q '.defaultBranchRef.name' 2>/dev/null || echo "")
+        
+        # If the API call failed, try a different approach
+        if [ -z "$default_branch" ]; then
+            # Try to get default branch using a different query
+            default_branch=$(gh repo view "$org_repo" --json defaultBranchRef -q '.defaultBranchRef.name // empty' 2>/dev/null || echo "")
+        fi
+        
+        # If still empty, try the simpler approach
+        if [ -z "$default_branch" ]; then
+            default_branch=$(gh repo view "$org_repo" --json defaultBranchRef 2>/dev/null | jq -r '.defaultBranchRef.name // empty' 2>/dev/null || echo "")
+        fi
+    fi
+    
+    if [ -n "$default_branch" ]; then
+        echo "$default_branch"
+        return 0
+    fi
+    
+    # Fallback to local detection (should not be used in import-org)
+    return 1
+}
+
+# Check if current directory is a workspace
+is_workspace() {
+    # Core workspace files that must exist
+    [[ -f "repos.txt" && -f "clone_repos.sh" && -f "add_repo.sh" && -f "update_repos.sh" && -f "setup_cron.sh" ]]
+}
+
+# Get global git-manage directory
+get_global_dir() {
+    echo "$HOME/.git-manage"
+}
+
+# Get default organizations config file
+get_default_orgs_file() {
+    echo "$(get_global_dir)/default_orgs.txt"
+}
+
+# Load default organizations from config
+load_default_orgs() {
+    local config_file=$(get_default_orgs_file)
+    DEFAULT_ORGS=()
+    
+    if [ -f "$config_file" ]; then
+        while IFS= read -r org; do
+            # Skip empty lines and comments
+            [[ -z "$org" || "$org" =~ ^[[:space:]]*# ]] && continue
+            DEFAULT_ORGS+=("$org")
+        done < "$config_file"
+    fi
+}
+
+# Save default organizations to config
+save_default_orgs() {
+    local config_file=$(get_default_orgs_file)
+    local global_dir=$(get_global_dir)
+    
+    # Create global directory if it doesn't exist
+    if [ ! -d "$global_dir" ]; then
+        mkdir -p "$global_dir"
+    fi
+    
+    # Save organizations to file
+    {
+        echo "# Default organizations for git-manage"
+        echo "# One organization per line"
+        echo "# Lines starting with # are comments"
+        echo ""
+        for org in "${DEFAULT_ORGS[@]}"; do
+            echo "$org"
+        done
+    } > "$config_file"
+    
+    log_success "✅ Default organizations saved: ${DEFAULT_ORGS[*]}"
+}
+
+# Get global org repos file for specific organization
+get_global_org_repos() {
+    local org_name="$1"
+    echo "$(get_global_dir)/$org_name/repos.txt"
+}
+
+# Get global org directory for specific organization
+get_global_org_dir() {
+    local org_name="$1"
+    echo "$(get_global_dir)/$org_name"
+}
+
+# Initialize global directory and files for organization
+init_global_org_config() {
+    local org_name="$1"
+    local global_org_dir=$(get_global_org_dir "$org_name")
+    local org_repos_file=$(get_global_org_repos "$org_name")
+    
+    if [ ! -d "$global_org_dir" ]; then
+        mkdir -p "$global_org_dir"
+        log_info "Created global org directory: $global_org_dir"
+    fi
+    
+    if [ ! -f "$org_repos_file" ]; then
+        cat > "$org_repos_file" << EOF
+# $org_name organization repositories
+# This file contains all available repositories for autocomplete and discovery
+# Format: git@github.com:org/repo.git<TAB>default_branch
+# Auto-populated by 'git-manage import-org $org_name'
+
+EOF
+        log_info "Created global org repos file: $org_repos_file"
+    fi
+}
+
+# Get list of all imported organizations
+get_imported_orgs() {
+    local global_dir=$(get_global_dir)
+    if [ ! -d "$global_dir" ]; then
+        return 0
+    fi
+    
+    find "$global_dir" -maxdepth 1 -type d -not -path "$global_dir" -exec basename {} \;
+}
+
+# Count repositories for an organization
+count_org_repos() {
+    local org_name="$1"
+    local org_repos_file=$(get_global_org_repos "$org_name")
+    
+    if [ ! -f "$org_repos_file" ]; then
+        echo "0"
+        return
+    fi
+    
+    grep -v '^#' "$org_repos_file" | grep -v '^[[:space:]]*$' | wc -l | xargs
+}
+
+# Check if organization data needs refresh (older than 24 hours)
+needs_refresh() {
+    local org_name="$1"
+    local org_repos_file=$(get_global_org_repos "$org_name")
+    
+    if [ ! -f "$org_repos_file" ]; then
+        return 0  # Needs refresh (doesn't exist)
+    fi
+    
+    # Check if file is older than 24 hours
+    local file_age=$(date -r "$org_repos_file" +%s 2>/dev/null || echo 0)
+    local now=$(date +%s)
+    local age_hours=$(( (now - file_age) / 3600 ))
+    
+    [ $age_hours -gt 24 ]
+}
+
+# Auto-refresh organization data if stale
+auto_refresh_if_stale() {
+    local org_name="$1"
+    
+    if needs_refresh "$org_name"; then
+        log_info "🔄 Refreshing stale data for $org_name..."
+        
+        # Refresh this specific org silently
+        local temp_repos=$(mktemp)
+        local global_repos_file=$(get_global_org_repos "$org_name")
+        
+        if gh repo list "$org_name" --limit 1000 --json sshUrl -q '.[].sshUrl' > "$temp_repos" 2>/dev/null; then
+            init_global_org_config "$org_name"
+            
+            # Fetch default branches for each repository
+            local temp_repos_with_branch=$(mktemp)
+            while IFS= read -r repo_url; do
+                # Skip empty lines and comments
+                [[ -z "$repo_url" || "$repo_url" =~ ^[[:space:]]*# ]] && continue
+                local repo_name=$(basename "$repo_url" .git)
+                local default_branch=""
+                default_branch=$(get_default_branch "$repo_url" "$repo_name" || true)
+                if [ -n "$default_branch" ]; then
+                    echo -e "$repo_url\t$default_branch" >> "$temp_repos_with_branch" || true
+                    success_count=$((success_count + 1))
+                else
+                    echo "$repo_url" >> "$temp_repos_with_branch" || true
+                    fail_count=$((fail_count + 1))
+                fi
+            done < "$temp_repos"
+            
+            # Update the repos file
+            {
+                echo "# $org_name organization repositories"
+                echo "# This file contains all available repositories for autocomplete and discovery"
+                echo "# Format: git@github.com:org/repo.git<TAB>default_branch"
+                echo "# Auto-populated by 'git-manage import-org $org_name'"
+                echo ""
+                cat "$temp_repos_with_branch" | sort -u
+            } > "$global_repos_file"
+            
+            local repo_count=$(count_org_repos "$org_name")
+            log_success "✅ Refreshed $org_name ($repo_count repos)"
+        else
+            log_warning "⚠️  Failed to refresh $org_name, using cached data"
+        fi
+        
+        rm -f "$temp_repos" "$temp_repos_with_branch"
+        echo
+    fi
+}
+
+# Check and install dependencies
+check_and_install_dependencies() {
+    local missing_deps=()
+    local deps=("git" "gh" "fzf")
+    
+    # Check which dependencies are missing
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
+    
+    if [ ${#missing_deps[@]} -eq 0 ]; then
+        log_success "✅ All dependencies are already installed"
+        return 0
+    fi
+    
+    log_info "Missing dependencies: ${missing_deps[*]}"
+    
+    # Ask user for permission to install
+    echo
+    read -p "Would you like to automatically install missing dependencies? (y/N): " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Skipping automatic installation"
+        log_info "Please install manually: ${missing_deps[*]}"
+        log_info "See README.md for installation instructions"
+        return 1
+    fi
+    
+    # Detect OS and package manager
+    local os_type=""
+    local install_cmd=""
+    
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        os_type="macOS"
+        if command -v brew &> /dev/null; then
+            install_cmd="brew install"
+        else
+            log_error "Homebrew is required on macOS but not installed"
+            log_info "Please install Homebrew first: https://brew.sh"
+            log_info "Then run: brew install git gh fzf"
+            return 1
+        fi
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        os_type="Linux"
+        if command -v apt &> /dev/null; then
+            install_cmd="sudo apt update && sudo apt install -y"
+        elif command -v yum &> /dev/null; then
+            install_cmd="sudo yum install -y"
+        elif command -v dnf &> /dev/null; then
+            install_cmd="sudo dnf install -y"
+        elif command -v pacman &> /dev/null; then
+            install_cmd="sudo pacman -S --noconfirm"
+        else
+            log_error "No supported package manager found (apt, yum, dnf, pacman)"
+            log_info "Please install dependencies manually: git gh fzf"
+            return 1
+        fi
+    else
+        log_error "Unsupported operating system: $OSTYPE"
+        log_info "Please install dependencies manually: git gh fzf"
+        return 1
+    fi
+    
+    log_info "🔧 Installing dependencies on $os_type..."
+    
+    # Install dependencies based on OS
+    if [[ "$os_type" == "macOS" ]]; then
+        for dep in "${missing_deps[@]}"; do
+            log_info "Installing $dep..."
+            if ! $install_cmd "$dep"; then
+                log_error "Failed to install $dep"
+                return 1
+            fi
+        done
+    elif [[ "$os_type" == "Linux" ]]; then
+        # Handle GitHub CLI special installation on Linux
+        local regular_deps=()
+        local needs_gh=false
+        
+        for dep in "${missing_deps[@]}"; do
+            if [[ "$dep" == "gh" ]]; then
+                needs_gh=true
+            else
+                regular_deps+=("$dep")
+            fi
+        done
+        
+        # Install regular dependencies
+        if [ ${#regular_deps[@]} -gt 0 ]; then
+            log_info "Installing: ${regular_deps[*]}"
+            if ! eval "$install_cmd ${regular_deps[*]}"; then
+                log_error "Failed to install regular dependencies"
+                return 1
+            fi
+        fi
+        
+        # Install GitHub CLI if needed
+        if [ "$needs_gh" = true ]; then
+            log_info "Installing GitHub CLI..."
+            if command -v apt &> /dev/null; then
+                # Ubuntu/Debian
+                if ! (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+                      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+                      sudo apt update && sudo apt install -y gh); then
+                    log_error "Failed to install GitHub CLI"
+                    return 1
+                fi
+            else
+                # Other Linux distros - try package manager
+                if ! eval "$install_cmd gh"; then
+                    log_warning "Failed to install gh via package manager"
+                    log_info "Please install GitHub CLI manually: https://cli.github.com/"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    
+    # Verify installation
+    local still_missing=()
+    for dep in "${missing_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            still_missing+=("$dep")
+        fi
+    done
+    
+    if [ ${#still_missing[@]} -gt 0 ]; then
+        log_error "Failed to install: ${still_missing[*]}"
+        log_info "Please install them manually and run install again"
+        return 1
+    fi
+    
+    log_success "✅ All dependencies installed successfully!"
+    return 0
+}
+
+# Install git-manage to PATH with completion support
+install_to_path() {
+    local install_dir="$HOME/.local/bin"
+    local script_name="git-manage"
+    local source_script="$(realpath "${BASH_SOURCE[0]}")"
+    local target_script="$install_dir/$script_name"
+    
+    # Ask for default organizations
+    echo
+    log_info "🔧 Configuration: Default Organizations"
+    echo
+    log_info "Which organizations would you like to set as defaults?"
+    log_info "These will be used for autocomplete and when no org is specified."
+    log_info "Examples: rudderlabs, microsoft, facebook, etc."
+    echo
+    
+    local default_orgs_input=""
+    read -p "Enter default organizations (comma-separated, or press Enter to skip): " default_orgs_input
+    
+    if [ -n "$default_orgs_input" ]; then
+        # Parse comma-separated organizations
+        IFS=',' read -ra org_array <<< "$default_orgs_input"
+        DEFAULT_ORGS=()
+        
+        for org in "${org_array[@]}"; do
+            # Trim whitespace
+            org=$(echo "$org" | xargs)
+            if [ -n "$org" ]; then
+                DEFAULT_ORGS+=("$org")
+            fi
+        done
+        
+        if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            log_info "Default organizations: ${DEFAULT_ORGS[*]}"
+        fi
+    fi
+    
+    # Create installation directory if it doesn't exist
+    if [ ! -d "$install_dir" ]; then
+        mkdir -p "$install_dir"
+        log_info "Created installation directory: $install_dir"
+    fi
+    
+    # Copy script to installation directory
+    if [ -f "$target_script" ]; then
+        log_info "Updating existing installation..."
+        # Check if it's the same file
+        if cmp -s "$source_script" "$target_script"; then
+            log_success "✅ Script is already up to date"
+        else
+            log_info "Updating with newer version..."
+        fi
+    else
+        log_info "Installing git-manage to: $target_script"
+    fi
+    
+    if cp "$source_script" "$target_script"; then
+        chmod +x "$target_script"
+        log_success "✅ Script installed successfully"
+    else
+        log_error "Failed to install script"
+        exit 1
+    fi
+    
+    # Detect shell configuration file
+    local shell_config=""
+    if [[ "$SHELL" == *"zsh"* ]]; then
+        shell_config="$HOME/.zshrc"
+    elif [[ "$SHELL" == *"bash"* ]]; then
+        shell_config="$HOME/.bashrc"
+    else
+        log_warning "Unsupported shell: $SHELL"
+        log_info "Manually add the following to your shell configuration:"
+        echo "   export PATH=\"$install_dir:\$PATH\""
+        exit 1
+    fi
+    
+    # Check if ~/.local/bin is already in PATH
+    local path_already_set=false
+    
+    # Check current PATH
+    if [[ ":$PATH:" == *":$install_dir:"* ]]; then
+        path_already_set=true
+        log_success "✅ ~/.local/bin is already in current PATH"
+    fi
+    
+    # Check if it's already configured in shell config
+    if grep -Fq "$install_dir" "$shell_config" 2>/dev/null; then
+        path_already_set=true
+        log_success "✅ ~/.local/bin is already configured in $shell_config"
+    fi
+    
+    # Add to shell config if not already there
+    if [ "$path_already_set" = false ]; then
+        local path_export="export PATH=\"$install_dir:\$PATH\""
+        echo "" >> "$shell_config"
+        echo "# git-manage tool" >> "$shell_config"
+        echo "$path_export" >> "$shell_config"
+        log_success "✅ Added ~/.local/bin to PATH in $shell_config"
+    fi
+    
+    # Check if git-manage is already available in PATH
+    if command -v git-manage &> /dev/null; then
+        local existing_path=$(which git-manage)
+        if [ "$existing_path" = "$target_script" ]; then
+            log_success "✅ git-manage is already available in PATH from this installation"
+        else
+            log_warning "⚠️  git-manage is already available in PATH from: $existing_path"
+            log_info "This installation will be available at: $target_script"
+        fi
+    fi
+    
+    # Save default organizations if any were provided
+    if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+        save_default_orgs
+    fi
+    
+    # Add shell completion
+    local completion_file="$HOME/.git-manage/completion.sh"
+    local completion_func='# git-manage completion for bash and zsh
+_git_manage_completion() {
+    local context state line
+    local -a commands repos orgs
+    
+    # Define main commands
+    commands=(
+        "install:Install git-manage to ~/.local/bin with completion"
+        "create:Initialize a workspace folder"
+        "clone:Clone repositories (interactive or specific)"
+        "update:Update all repositories in workspace"
+        "sync:Sync repositories (check before pull)"
+        "reset:Reset repositories to base branches"
+        "upgrade:Upgrade workspace with missing scripts"
+        "setup-cron:Setup automatic updates"
+        "import-org:Cache repository list from organization"
+        "list-orgs:List all imported organizations"
+        "refresh-orgs:Refresh all organization lists"
+        "setup-org-cron:Setup automatic org refresh"
+        "select-repos:Interactive repository selection"
+        "config-orgs:Configure default organizations"
+        "help:Show help message"
+    )
+    
+    if [[ -n ${ZSH_VERSION-} ]]; then
+        # zsh completion
+        _arguments -C \
+            "1: :->command" \
+            "2: :->arg1" \
+            "3: :->arg2" \
+            "*::arg:->args" && return 0
+        
+        case $state in
+            command)
+                _describe -t commands "git-manage commands" commands
+                ;;
+            arg1)
+                case $words[2] in
+                    clone)
+                        # Complete repository names from cached org data
+                        local global_dir="$HOME/.git-manage"
+                        repos=()
+                        
+                        # Load default organizations
+                        local default_orgs=()
+                        if [[ -f "$global_dir/default_orgs.txt" ]]; then
+                            default_orgs=(${(f)"$(grep -v "^#" "$global_dir/default_orgs.txt" 2>/dev/null | grep -v "^[[:space:]]*$")"})
+                        fi
+                        
+                        # Get repos from default orgs first (short names)
+                        for org in $default_orgs; do
+                            if [[ -f "$global_dir/$org/repos.txt" ]]; then
+                                repos+=(${(f)"$(grep -v "^#" "$global_dir/$org/repos.txt" 2>/dev/null | cut -f1 | sed "s|git@github.com:$org/||g" | sed "s|\.git$||g" | grep -v "^[[:space:]]*$")"})
+                            fi
+                        done
+                        
+                        # Add org/repo format from all orgs
+                        for org_dir in "$global_dir"/*(/); do
+                            local org_name=${org_dir:t}
+                            if [[ -f "$org_dir/repos.txt" ]]; then
+                                repos+=(${(f)"$(grep -v "^#" "$org_dir/repos.txt" 2>/dev/null | cut -f1 | sed "s|git@github.com:||g" | sed "s|\.git$||g" | grep -v "^[[:space:]]*$")"})
+                            fi
+                        done
+                        
+                        _describe -t repos "repositories" repos
+                        ;;
+                    import-org|select-repos)
+                        # Complete organization names
+                        local global_dir="$HOME/.git-manage"
+                        orgs=()
+                        
+                        # Load default organizations first
+                        if [[ -f "$global_dir/default_orgs.txt" ]]; then
+                            orgs+=(${(f)"$(grep -v "^#" "$global_dir/default_orgs.txt" 2>/dev/null | grep -v "^[[:space:]]*$")"})
+                        fi
+                        
+                        # Add all imported organizations
+                        if [[ -d "$global_dir" ]]; then
+                            orgs+=(${(f)"$(find "$global_dir" -maxdepth 1 -type d -not -path "$global_dir" -exec basename {} \;)"})
+                        fi
+                        
+                        # Remove duplicates
+                        orgs=(${(u)orgs})
+                        _describe -t orgs "organizations" orgs
+                        ;;
+                esac
+                ;;
+            arg2)
+                case $words[2] in
+                    clone)
+                        # Complete organization names for second argument
+                        local global_dir="$HOME/.git-manage"
+                        orgs=()
+                        if [[ -d "$global_dir" ]]; then
+                            orgs=(${(f)"$(find "$global_dir" -maxdepth 1 -type d -not -path "$global_dir" -exec basename {} \;)"})
+                        fi
+                        _describe -t orgs "organizations" orgs
+                        ;;
+                esac
+                ;;
+        esac
+    else
+        # bash completion
+        local cur prev opts
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        
+            # Main commands
+    if [ ${COMP_CWORD} -eq 1 ]; then
+        opts="install create clone update sync reset upgrade setup-cron import-org list-orgs refresh-orgs setup-org-cron select-repos config-orgs help"
+        COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
+        return 0
+    fi
+        
+        # Command-specific completions
+        case "${COMP_WORDS[1]}" in
+            clone)
+                if [ ${COMP_CWORD} -eq 2 ]; then
+                    # Complete repository names from cached org data
+                    local global_dir="$HOME/.git-manage"
+                    local repos=""
+                    
+                    # Load default organizations
+                    local default_orgs=""
+                    if [ -f "$global_dir/default_orgs.txt" ]; then
+                        default_orgs=$(grep -v "^#" "$global_dir/default_orgs.txt" 2>/dev/null | grep -v "^[[:space:]]*$" | tr "\n" " ")
+                    fi
+                    
+                    # Get repos from default orgs first (short names)
+                    for org in $default_orgs; do
+                        if [ -f "$global_dir/$org/repos.txt" ]; then
+                            repos+=" $(grep -v "^#" "$global_dir/$org/repos.txt" 2>/dev/null | cut -f1 | sed "s|git@github.com:$org/||g" | sed "s|\.git$||g" | grep -v "^[[:space:]]*$" | tr "\n" " ")"
+                        fi
+                    done
+                    
+                    # Add org/repo format from all orgs
+                    for org_dir in "$global_dir"/*; do
+                        [ -d "$org_dir" ] || continue
+                        local org_name=$(basename "$org_dir")
+                        if [ -f "$org_dir/repos.txt" ]; then
+                            repos+=" $(grep -v "^#" "$org_dir/repos.txt" 2>/dev/null | cut -f1 | sed "s|git@github.com:||g" | sed "s|\.git$||g" | grep -v "^[[:space:]]*$" | tr "\n" " ")"
+                        fi
+                    done
+                    
+                    COMPREPLY=( $(compgen -W "${repos}" -- ${cur}) )
+                elif [ ${COMP_CWORD} -eq 3 ]; then
+                    # Complete organization names for second argument
+                    local global_dir="$HOME/.git-manage"
+                    local orgs=""
+                    if [ -d "$global_dir" ]; then
+                        orgs=$(find "$global_dir" -maxdepth 1 -type d -not -path "$global_dir" -exec basename {} \; | tr "\n" " ")
+                    fi
+                    COMPREPLY=( $(compgen -W "${orgs}" -- ${cur}) )
+                fi
+                ;;
+            import-org|select-repos)
+                # Complete organization names
+                local global_dir="$HOME/.git-manage" 
+                local orgs=""
+                
+                # Load default organizations first
+                if [ -f "$global_dir/default_orgs.txt" ]; then
+                    orgs=$(grep -v "^#" "$global_dir/default_orgs.txt" 2>/dev/null | grep -v "^[[:space:]]*$" | tr "\n" " ")
+                fi
+                
+                # Add all imported organizations
+                if [ -d "$global_dir" ]; then
+                    orgs+=" $(find "$global_dir" -maxdepth 1 -type d -not -path "$global_dir" -exec basename {} \; | tr "\n" " ")"
+                fi
+                
+                COMPREPLY=( $(compgen -W "${orgs}" -- ${cur}) )
+                ;;
+        esac
+    fi
+}
+
+# Set up completion for both bash and zsh
+if [[ -n ${ZSH_VERSION-} ]]; then
+    # zsh completion setup
+    autoload -U compinit && compinit
+    compdef _git_manage_completion git-manage
+else
+    # bash completion setup
+    complete -F _git_manage_completion git-manage
+fi
+'
+    
+    # Create completion file
+    mkdir -p "$(dirname "$completion_file")"
+    echo "$completion_func" > "$completion_file"
+    chmod +x "$completion_file"
+    
+    # Check if completion is already sourced in shell config
+    if ! grep -Fq "git-manage/completion.sh" "$shell_config" 2>/dev/null; then
+        echo "" >> "$shell_config"
+        echo "# git-manage completion" >> "$shell_config"
+        echo "source \"$completion_file\"" >> "$shell_config"
+        log_success "✅ Added completion source to $shell_config"
+    else
+        log_success "✅ Completion already sourced in $shell_config"
+    fi
+    
+    echo
+    log_success "🎉 Installation complete!"
+    echo
+    log_info "📋 What's installed:"
+    echo "   • git-manage script copied to ~/.local/bin"
+    echo "   • ~/.local/bin added to PATH"
+    echo "   • Tab completion for commands and repository names"
+    echo "   • Works with both bash and zsh"
+    echo
+    log_info "🚀 Usage:"
+    echo "   git-manage <tab><tab>           # See all commands"
+    echo "   git-manage clone <tab>          # Autocomplete repo names"
+    echo "   git-manage create workspace     # Create workspace"
+    echo
+    log_info "⚡ To use immediately:"
+    echo "   source $shell_config"
+    echo "   # or restart your terminal"
+    echo
+    log_info "💡 For directory switching on create:"
+    echo "   git-manage create workspace && cd workspace"
+    echo
+    log_info "🔧 Installation location: $target_script"
+}
+
+# Interactive repository cloner (gh-clone functionality)
+interactive_clone() {
+    # Load default organizations
+    load_default_orgs
+    
+    local org_name="$1"
+    
+    # If no org specified, use first default org or show error
+    if [ -z "$org_name" ]; then
+        if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            org_name="${DEFAULT_ORGS[0]}"
+            log_info "No organization specified, using first default: $org_name"
+        else
+            log_error "No organization specified and no default organizations set"
+            log_info "Use 'git-manage clone <org-name>' or set default organizations"
+            exit 1
+        fi
+    fi
+    
+    check_dependencies gh fzf git
+    check_gh_auth
+    
+    # Auto-refresh if data is stale
+    auto_refresh_if_stale "$org_name"
+    
+    log_info "Fetching repositories from GitHub organization: $org_name"
+    
+    # Create temporary files
+    local temp_repos=$(mktemp)
+    local temp_selected=$(mktemp)
+    local temp_display=$(mktemp)
+    
+    # Cleanup temporary files on exit
+    trap 'rm -f "$temp_repos" "$temp_selected" "$temp_display"' EXIT
+    
+    # Fetch repositories from GitHub
+    log_info "Loading repository list..."
+    if ! gh repo list "$org_name" --limit 1000 --json name,description,sshUrl,isPrivate,language,stargazerCount -q '.[] | "\(.name)\t\(.description // "No description")\t\(.sshUrl)\t\(.isPrivate)\t\(.language // "Unknown")\t\(.stargazerCount)"' > "$temp_repos"; then
+        log_error "Failed to fetch repositories from '$org_name'"
+        exit 1
+    fi
+    
+    if [ ! -s "$temp_repos" ]; then
+        log_warning "No repositories found for '$org_name'"
+        exit 0
+    fi
+    
+    local repo_count=$(wc -l < "$temp_repos")
+    log_success "Found $repo_count repositories"
+    
+    # Format display for fzf
+    while IFS=$'\t' read -r name desc ssh_url is_private language stars; do
+        local private_indicator=""
+        if [ "$is_private" = "true" ]; then
+            private_indicator=" 🔒"
+        fi
+        
+        local star_indicator=""
+        if [ "$stars" != "0" ]; then
+            star_indicator=" ⭐$stars"
+        fi
+        
+        local lang_indicator=""
+        if [ "$language" != "Unknown" ] && [ "$language" != "null" ]; then
+            lang_indicator=" [$language]"
+        fi
+        
+        printf "%s%s%s%s\t%s\t%s\n" "$name" "$private_indicator" "$star_indicator" "$lang_indicator" "$desc" "$ssh_url"
+    done < "$temp_repos" > "$temp_display"
+    
+    # Use fzf for interactive selection
+    log_info "Use Tab to select/deselect, Enter to confirm, Esc to cancel"
+    
+    if ! cat "$temp_display" | fzf -m \
+        --header="Select repositories to clone (Tab: select/deselect, Enter: confirm)" \
+        --preview="echo 'SSH URL: {3}' && echo 'Description: {2}'" \
+        --preview-window="down:3:wrap" \
+        --delimiter='\t' \
+        --with-nth=1,2 \
+        --bind="tab:toggle" \
+        --bind="ctrl-a:select-all" \
+        --bind="ctrl-d:deselect-all" \
+        --height=80% > "$temp_selected"; then
+        log_info "Selection cancelled"
+        exit 0
+    fi
+    
+    if [ ! -s "$temp_selected" ]; then
+        log_info "No repositories selected"
+        exit 0
+    fi
+    
+    # Extract SSH URLs and clone
+    local selected_ssh_urls=$(mktemp)
+    cut -f3 "$temp_selected" > "$selected_ssh_urls"
+    
+    # Show selected repositories
+    local selected_count=$(wc -l < "$temp_selected")
+    log_success "Selected $selected_count repositories:"
+    
+    while IFS=$'\t' read -r display_name desc ssh_url; do
+        local clean_name=$(echo "$display_name" | sed 's/[🔒⭐].*//' | sed 's/\[.*\]//' | xargs)
+        log_info "  - $clean_name"
+    done < "$temp_selected"
+    
+    echo
+    read -p "Clone these repositories? (y/N): " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Cancelled"
+        exit 0
+    fi
+    
+    # Clone repositories
+    local total_repos=$(wc -l < "$selected_ssh_urls")
+    local current=0
+    local success=0
+    local failed=0
+    
+    log_info "Cloning $total_repos repositories..."
+    
+    while IFS= read -r ssh_url; do
+        current=$((current + 1))
+        local repo_name=$(basename "$ssh_url" .git)
+        
+        log_info "[$current/$total_repos] Cloning $repo_name..."
+        
+        if [ -d "$repo_name" ]; then
+            log_warning "Repository '$repo_name' already exists, skipping..."
+            continue
+        fi
+        
+        if git clone "$ssh_url"; then
+            log_success "Successfully cloned $repo_name"
+            success=$((success + 1))
+        else
+            log_error "Failed to clone $repo_name"
+            failed=$((failed + 1))
+        fi
+        
+        echo
+    done < "$selected_ssh_urls"
+    
+    log_success "Cloning completed! Success: $success, Failed: $failed"
+}
+
+# Create workspace structure
+create_workspace() {
+    local workspace_name="$1"
+    
+    if [ -z "$workspace_name" ]; then
+        log_error "Workspace name is required"
+        show_usage
+        exit 1
+    fi
+    
+    if [ -d "$workspace_name" ]; then
+        log_error "Workspace '$workspace_name' already exists"
+        exit 1
+    fi
+    
+    log_info "Creating workspace: $workspace_name"
+    mkdir -p "$workspace_name"
+    cd "$workspace_name"
+    
+    # Create repos.txt with header
+    cat > repos.txt << 'EOF'
+# Git repositories list
+# Add one repository URL per line
+# Lines starting with # are comments and will be ignored
+# Example: git@github.com:user/repo.git
+
+EOF
+    
+    # Create clone_repos.sh
+    cat > clone_repos.sh << 'EOF'
+#!/bin/bash
+
+# Clone all repositories listed in repos.txt
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+log_info "Cloning repositories from repos.txt..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ -d "$repo_name" ]; then
+        log_info "Repository '$repo_name' already exists, skipping..."
+        continue
+    fi
+    
+    log_info "Cloning $repo_url..."
+    if git clone "$repo_url"; then
+        log_success "Successfully cloned $repo_name"
+    else
+        log_error "Failed to clone $repo_url"
+    fi
+done < repos.txt
+
+log_success "Repository cloning completed"
+EOF
+    
+    # Create add_repo.sh
+    cat > add_repo.sh << 'EOF'
+#!/bin/bash
+
+# Add a repository to repos.txt and clone it
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <git-repo-url>"
+    exit 1
+fi
+
+repo_url="$1"
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+# Check if repo already exists in repos.txt
+if grep -Fxq "$repo_url" repos.txt; then
+    log_info "Repository already exists in repos.txt"
+else
+    echo "$repo_url" >> repos.txt
+    log_success "Added $repo_url to repos.txt"
+fi
+
+# Clone the repository
+repo_name=$(basename "$repo_url" .git)
+if [ -d "$repo_name" ]; then
+    log_info "Repository '$repo_name' already exists locally"
+else
+    log_info "Cloning $repo_url..."
+    if git clone "$repo_url"; then
+        log_success "Successfully cloned $repo_name"
+    else
+        log_error "Failed to clone $repo_url"
+        exit 1
+    fi
+fi
+EOF
+    
+    # Create update_repos.sh
+    cat > update_repos.sh << 'EOF'
+#!/bin/bash
+
+# Update all repositories by pulling latest changes from their default branch
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+log_warning() {
+    echo -e "\033[1;33m[WARNING]\033[0m $1"
+}
+
+# Minimal get_default_branch for standalone script
+get_default_branch() {
+    local repo_url="$1"
+    local org_repo=""
+    if [[ "$repo_url" == git@github.com:* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|git@github.com:||' | sed 's|\.git$||')
+    elif [[ "$repo_url" == https://github.com/* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|https://github.com/||' | sed 's|\.git$||')
+    else
+        return 1
+    fi
+    local org_name=$(echo "$org_repo" | cut -d'/' -f1)
+    local global_repos_file="$HOME/.git-manage/$org_name/repos.txt"
+    if [ -f "$global_repos_file" ]; then
+        local cached_branch=$(grep -F "$repo_url" "$global_repos_file" | cut -f2 2>/dev/null || echo "")
+        if [ -n "$cached_branch" ]; then
+            echo "$cached_branch"
+            return 0
+        fi
+    fi
+    # Fallback to local detection
+    if git show-ref --verify --quiet refs/heads/main; then
+        echo "main"
+        return 0
+    elif git show-ref --verify --quiet refs/heads/master; then
+        echo "master"
+        return 0
+    else
+        git branch --show-current 2>/dev/null || echo ""
+        return 1
+    fi
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+log_info "Updating repositories..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ ! -d "$repo_name" ]; then
+        log_warning "Repository '$repo_name' directory not found, skipping..."
+        continue
+    fi
+    
+    log_info "Updating $repo_name..."
+    cd "$repo_name"
+    
+    # Check if it's a git repository
+    if [ ! -d ".git" ]; then
+        log_warning "$repo_name is not a git repository, skipping..."
+        cd ..
+        continue
+    fi
+    
+    # Get current branch
+    current_branch=$(git branch --show-current)
+    
+    # Get default branch
+    default_branch=$(get_default_branch "$repo_url")
+    if [ -z "$default_branch" ]; then
+        log_warning "Could not determine default branch for $repo_name, staying on current branch"
+        default_branch="$current_branch"
+    elif [ "$default_branch" != "$current_branch" ]; then
+        log_info "Default branch for $repo_name is: $default_branch"
+    fi
+    
+    # Switch to default branch if not already there
+    if [ "$current_branch" != "$default_branch" ]; then
+        log_info "Switching to $default_branch branch..."
+        git checkout "$default_branch" || {
+            log_warning "Failed to checkout $default_branch, staying on $current_branch"
+            default_branch="$current_branch"
+        }
+    fi
+    
+    # Pull latest changes
+    if git pull origin "$default_branch"; then
+        log_success "Successfully updated $repo_name"
+    else
+        log_error "Failed to update $repo_name"
+    fi
+    
+    cd ..
+done < repos.txt
+
+log_success "Repository updates completed"
+EOF
+    
+    # Create setup_cron.sh
+    cat > setup_cron.sh << 'EOF'
+#!/bin/bash
+
+# Setup cron job to update repositories every 6 hours
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+WORKSPACE_DIR="$(pwd)"
+UPDATE_SCRIPT="$WORKSPACE_DIR/update_repos.sh"
+
+if [ ! -f "$UPDATE_SCRIPT" ]; then
+    log_error "update_repos.sh not found in current directory"
+    exit 1
+fi
+
+# Create multiple cron job entries for laptop-friendly times
+CRON_ENTRIES=(
+    "0 9 * * 1-5 cd \"$WORKSPACE_DIR\" && ./update_repos.sh >> \"$WORKSPACE_DIR/update.log\" 2>&1"   # 9 AM weekdays
+    "0 14 * * * cd \"$WORKSPACE_DIR\" && ./update_repos.sh >> \"$WORKSPACE_DIR/update.log\" 2>&1"    # 2 PM daily
+    "0 17 * * 1-5 cd \"$WORKSPACE_DIR\" && ./update_repos.sh >> \"$WORKSPACE_DIR/update.log\" 2>&1"  # 5 PM weekdays
+)
+
+# Check if cron job already exists
+if crontab -l 2>/dev/null | grep -Fq "$UPDATE_SCRIPT"; then
+    log_info "Cron job for this workspace already exists"
+    log_info "Updates run when laptop is likely to be on"
+    exit 0
+fi
+
+# Add cron jobs
+current_cron=$(crontab -l 2>/dev/null || true)
+{
+    echo "$current_cron"
+    for entry in "${CRON_ENTRIES[@]}"; do
+        echo "$entry"
+    done
+} | crontab -
+
+log_success "Cron job added successfully"
+log_info "📅 Schedule: Multiple times when laptop is likely on:"
+echo "     • 9:00 AM (weekdays) - Morning startup"
+echo "     • 2:00 PM (daily)    - Afternoon check"
+echo "     • 5:00 PM (weekdays) - Before end of day"
+log_info "📝 Updates will be logged to update.log"
+EOF
+    
+    # Create reset_repos.sh
+    cat > reset_repos.sh << 'EOF'
+#!/bin/bash
+
+# Reset all repositories to base branches (discard local changes)
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+log_warning() {
+    echo -e "\033[1;33m[WARNING]\033[0m $1"
+}
+
+# Minimal get_default_branch for standalone script
+get_default_branch() {
+    local repo_url="$1"
+    local org_repo=""
+    if [[ "$repo_url" == git@github.com:* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|git@github.com:||' | sed 's|\.git$||')
+    elif [[ "$repo_url" == https://github.com/* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|https://github.com/||' | sed 's|\.git$||')
+    else
+        return 1
+    fi
+    local org_name=$(echo "$org_repo" | cut -d'/' -f1)
+    local global_repos_file="$HOME/.git-manage/$org_name/repos.txt"
+    if [ -f "$global_repos_file" ]; then
+        local cached_branch=$(grep -F "$repo_url" "$global_repos_file" | cut -f2 2>/dev/null || echo "")
+        if [ -n "$cached_branch" ]; then
+            echo "$cached_branch"
+            return 0
+        fi
+    fi
+    # Fallback to local detection
+    if git show-ref --verify --quiet refs/heads/main; then
+        echo "main"
+        return 0
+    elif git show-ref --verify --quiet refs/heads/master; then
+        echo "master"
+        return 0
+    else
+        git branch --show-current 2>/dev/null || echo ""
+        return 1
+    fi
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+# Confirm action
+echo
+log_warning "⚠️  This will discard all local changes in all repositories!"
+read -p "Are you sure you want to reset all repositories? (y/N): " -n 1 -r
+echo
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    log_info "Reset cancelled"
+    exit 0
+fi
+
+log_info "Resetting repositories..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ ! -d "$repo_name" ]; then
+        log_warning "Repository '$repo_name' directory not found, skipping..."
+        continue
+    fi
+    
+    log_info "Resetting $repo_name..."
+    cd "$repo_name"
+    
+    # Check if it's a git repository
+    if [ ! -d ".git" ]; then
+        log_warning "$repo_name is not a git repository, skipping..."
+        cd ..
+        continue
+    fi
+    
+    # Get current branch
+    current_branch=$(git branch --show-current)
+    
+    # Get default branch from GitHub API or fallback to local detection
+    default_branch=$(get_default_branch "$repo_url" "$repo_name")
+    if [ -z "$default_branch" ]; then
+        log_warning "Could not determine default branch for $repo_name, staying on current branch"
+        default_branch="$current_branch"
+    elif [ "$default_branch" != "$current_branch" ]; then
+        log_info "Default branch for $repo_name is: $default_branch"
+    fi
+    
+    # Reset to base branch
+    if [ "$current_branch" != "$default_branch" ]; then
+        log_info "Switching to $default_branch branch..."
+        git checkout "$default_branch" || {
+            log_warning "Failed to checkout $default_branch, staying on $current_branch"
+            default_branch="$current_branch"
+        }
+    fi
+    
+    # Reset all changes
+    if git reset --hard HEAD && git clean -fd; then
+        log_success "Successfully reset $repo_name"
+    else
+        log_error "Failed to reset $repo_name"
+    fi
+    
+    cd ..
+done < repos.txt
+
+log_success "Repository reset completed"
+EOF
+
+    # Create sync_repos.sh
+    cat > sync_repos.sh << 'EOF'
+#!/bin/bash
+
+# Sync repositories - check for changes before pulling
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+log_warning() {
+    echo -e "\033[1;33m[WARNING]\033[0m $1"
+}
+
+# Minimal get_default_branch for standalone script
+get_default_branch() {
+    local repo_url="$1"
+    local org_repo=""
+    if [[ "$repo_url" == git@github.com:* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|git@github.com:||' | sed 's|\.git$||')
+    elif [[ "$repo_url" == https://github.com/* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|https://github.com/||' | sed 's|\.git$||')
+    else
+        return 1
+    fi
+    local org_name=$(echo "$org_repo" | cut -d'/' -f1)
+    local global_repos_file="$HOME/.git-manage/$org_name/repos.txt"
+    if [ -f "$global_repos_file" ]; then
+        local cached_branch=$(grep -F "$repo_url" "$global_repos_file" | cut -f2 2>/dev/null || echo "")
+        if [ -n "$cached_branch" ]; then
+            echo "$cached_branch"
+            return 0
+        fi
+    fi
+    # Fallback to local detection
+    if git show-ref --verify --quiet refs/heads/main; then
+        echo "main"
+        return 0
+    elif git show-ref --verify --quiet refs/heads/master; then
+        echo "master"
+        return 0
+    else
+        git branch --show-current 2>/dev/null || echo ""
+        return 1
+    fi
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+log_info "Syncing repositories..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ ! -d "$repo_name" ]; then
+        log_warning "Repository '$repo_name' directory not found, skipping..."
+        continue
+    fi
+    
+    log_info "Syncing $repo_name..."
+    cd "$repo_name"
+    
+    # Check if it's a git repository
+    if [ ! -d ".git" ]; then
+        log_warning "$repo_name is not a git repository, skipping..."
+        cd ..
+        continue
+    fi
+    
+    # Get current branch
+    current_branch=$(git branch --show-current)
+    
+    # Get default branch
+    default_branch=$(get_default_branch "$repo_url")
+    if [ -z "$default_branch" ]; then
+        log_warning "Could not determine default branch for $repo_name, staying on current branch"
+        default_branch="$current_branch"
+    elif [ "$default_branch" != "$current_branch" ]; then
+        log_info "Default branch for $repo_name is: $default_branch"
+    fi
+    
+    # Switch to default branch if not already there
+    if [ "$current_branch" != "$default_branch" ]; then
+        log_info "Switching to $default_branch branch..."
+        git checkout "$default_branch" || {
+            log_warning "Failed to checkout $default_branch, staying on $current_branch"
+            default_branch="$current_branch"
+        }
+    fi
+    
+    # Check if there are local changes
+    if ! git diff-index --quiet HEAD --; then
+        log_warning "$repo_name has local changes, skipping sync"
+        cd ..
+        continue
+    fi
+    
+    # Check if there are untracked files
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        log_warning "$repo_name has untracked files, skipping sync"
+        cd ..
+        continue
+    fi
+    
+    # Check if we're behind remote
+    git fetch origin "$default_branch" > /dev/null 2>&1
+    local_behind=$(git rev-list HEAD..origin/"$default_branch" --count 2>/dev/null || echo "0")
+    
+    if [ "$local_behind" -gt 0 ]; then
+        log_info "Pulling $local_behind commits from remote..."
+        if git pull origin "$default_branch"; then
+            log_success "Successfully synced $repo_name"
+        else
+            log_error "Failed to sync $repo_name"
+        fi
+    else
+        log_info "$repo_name is already up to date"
+    fi
+    
+    cd ..
+done < repos.txt
+
+log_success "Repository sync completed"
+EOF
+
+    # Make all scripts executable
+    chmod +x clone_repos.sh add_repo.sh update_repos.sh reset_repos.sh sync_repos.sh setup_cron.sh
+    
+    log_success "Workspace '$workspace_name' created successfully!"
+    echo
+    log_info "🚀 Next steps:"
+    echo "   cd $workspace_name            # Enter the workspace"
+    echo "   git-manage clone              # Interactive repository picker"
+    echo "   git-manage clone rudder-server # Clone specific repository"  
+    echo "   git-manage import-org         # Import all from rudderlabs"
+    echo
+    log_info "💡 Quick start: cd $workspace_name && git-manage clone"
+    echo
+    log_warning "⚠️  Note: You need to manually 'cd $workspace_name' to enter the workspace"
+}
+
+# Clone repositories (context-aware)
+clone_repos() {
+    local repo_input="$1"
+    local org_name="$2"
+    
+    # Load default organizations
+    load_default_orgs
+    
+    # If in workspace and no args, show interactive picker
+    if is_workspace && [ -z "$repo_input" ]; then
+        log_info "Interactive repository picker (workspace mode)"
+        if [ -n "$org_name" ]; then
+            interactive_clone "$org_name"
+        elif [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            # Use first default org for interactive picker
+            interactive_clone "${DEFAULT_ORGS[0]}"
+        else
+            log_error "No organization specified and no default organizations set"
+            log_info "Use 'git-manage clone <org-name>' or set default organizations"
+            exit 1
+        fi
+        return
+    fi
+    
+    # If not in workspace and no args, show interactive picker
+    if ! is_workspace && [ -z "$repo_input" ]; then
+        log_info "Interactive repository picker"
+        if [ -n "$org_name" ]; then
+            interactive_clone "$org_name"
+        elif [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            # Use first default org for interactive picker
+            interactive_clone "${DEFAULT_ORGS[0]}"
+        else
+            log_error "No organization specified and no default organizations set"
+            log_info "Use 'git-manage clone <org-name>' or set default organizations"
+            exit 1
+        fi
+        return
+    fi
+    
+    # If not in workspace but repo specified, just clone it
+    if ! is_workspace; then
+        local repo_url
+        if [[ "$repo_input" == git@* || "$repo_input" == https://* ]]; then
+            repo_url="$repo_input"
+        elif [[ "$repo_input" == */* ]]; then
+            repo_url="git@github.com:${repo_input}.git"
+        else
+            # Try to find repo in default organizations
+            local found_org=""
+            for org in "${DEFAULT_ORGS[@]}"; do
+                local global_repos_file=$(get_global_org_repos "$org")
+                if [ -f "$global_repos_file" ] && grep -q "git@github.com:$org/$repo_input.git" "$global_repos_file"; then
+                    found_org="$org"
+                    break
+                fi
+            done
+            
+            if [ -n "$found_org" ]; then
+                repo_url="git@github.com:${found_org}/${repo_input}.git"
+                log_info "Found repository in default org '$found_org'"
+            elif [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+                repo_url="git@github.com:${DEFAULT_ORGS[0]}/${repo_input}.git"
+                log_info "Using first default org '${DEFAULT_ORGS[0]}' for repository '$repo_input'"
+            else
+                log_error "No default organizations set and no org specified"
+                log_info "Use 'git-manage clone <org/repo>' or set default organizations"
+                exit 1
+            fi
+        fi
+        
+        local repo_name=$(basename "$repo_url" .git)
+        if [ -d "$repo_name" ]; then
+            log_warning "Repository '$repo_name' already exists"
+            exit 1
+        fi
+        
+        log_info "Cloning $repo_url..."
+        git clone "$repo_url"
+        log_success "Successfully cloned $repo_name"
+        return
+    fi
+    
+    # In workspace with repo specified - add to workspace
+    local repo_url
+    if [[ "$repo_input" == git@* || "$repo_input" == https://* ]]; then
+        repo_url="$repo_input"
+    elif [[ "$repo_input" == */* ]]; then
+        repo_url="git@github.com:${repo_input}.git"
+    else
+        # Try to find repo in default organizations
+        local found_org=""
+        for org in "${DEFAULT_ORGS[@]}"; do
+            local global_repos_file=$(get_global_org_repos "$org")
+            if [ -f "$global_repos_file" ] && grep -q "git@github.com:$org/$repo_input.git" "$global_repos_file"; then
+                found_org="$org"
+                break
+            fi
+        done
+        
+        if [ -n "$found_org" ]; then
+            repo_url="git@github.com:${found_org}/${repo_input}.git"
+            log_info "Found repository in default org '$found_org'"
+        elif [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            repo_url="git@github.com:${DEFAULT_ORGS[0]}/${repo_input}.git"
+            log_info "Using first default org '${DEFAULT_ORGS[0]}' for repository '$repo_input'"
+        else
+            log_error "No default organizations set and no org specified"
+            log_info "Use 'git-manage clone <org/repo>' or set default organizations"
+            exit 1
+        fi
+    fi
+    
+    log_info "Adding repository to workspace: $repo_url"
+    ./add_repo.sh "$repo_url"
+}
+
+# Upgrade existing workspace with missing scripts
+upgrade_workspace() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace"
+        exit 1
+    fi
+    
+    log_info "Checking for missing workspace scripts..."
+    
+    local missing_scripts=()
+    
+    # Check for missing scripts
+    if [ ! -f "reset_repos.sh" ]; then
+        missing_scripts+=("reset_repos.sh")
+    fi
+    
+    if [ ! -f "sync_repos.sh" ]; then
+        missing_scripts+=("sync_repos.sh")
+    fi
+    
+    if [ ${#missing_scripts[@]} -eq 0 ]; then
+        log_success "✅ Workspace is already up to date"
+        return 0
+    fi
+    
+    log_info "Adding missing scripts: ${missing_scripts[*]}"
+    
+    # Create reset_repos.sh if missing
+    if [ ! -f "reset_repos.sh" ]; then
+        cat > reset_repos.sh << 'EOF'
+#!/bin/bash
+
+# Reset all repositories to base branches (discard local changes)
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+log_warning() {
+    echo -e "\033[1;33m[WARNING]\033[0m $1"
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+# Confirm action
+echo
+log_warning "⚠️  This will discard all local changes in all repositories!"
+read -p "Are you sure you want to reset all repositories? (y/N): " -n 1 -r
+echo
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    log_info "Reset cancelled"
+    exit 0
+fi
+
+log_info "Resetting repositories..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ ! -d "$repo_name" ]; then
+        log_warning "Repository '$repo_name' directory not found, skipping..."
+        continue
+    fi
+    
+    log_info "Resetting $repo_name..."
+    cd "$repo_name"
+    
+    # Check if it's a git repository
+    if [ ! -d ".git" ]; then
+        log_warning "$repo_name is not a git repository, skipping..."
+        cd ..
+        continue
+    fi
+    
+    # Get current branch
+    current_branch=$(git branch --show-current)
+    
+    # Get default branch from GitHub API or fallback to local detection
+    default_branch=$(get_default_branch "$repo_url" "$repo_name")
+    if [ -z "$default_branch" ]; then
+        log_warning "Could not determine default branch for $repo_name, staying on current branch"
+        default_branch="$current_branch"
+    elif [ "$default_branch" != "$current_branch" ]; then
+        log_info "Default branch for $repo_name is: $default_branch"
+    fi
+    
+    # Reset to base branch
+    if [ "$current_branch" != "$default_branch" ]; then
+        log_info "Switching to $default_branch branch..."
+        git checkout "$default_branch" || {
+            log_warning "Failed to checkout $default_branch, staying on $current_branch"
+            default_branch="$current_branch"
+        }
+    fi
+    
+    # Reset all changes
+    if git reset --hard HEAD && git clean -fd; then
+        log_success "Successfully reset $repo_name"
+    else
+        log_error "Failed to reset $repo_name"
+    fi
+    
+    cd ..
+done < repos.txt
+
+log_success "Repository reset completed"
+EOF
+        chmod +x reset_repos.sh
+        log_success "✅ Created reset_repos.sh"
+    fi
+    
+    # Create sync_repos.sh if missing
+    if [ ! -f "sync_repos.sh" ]; then
+        cat > sync_repos.sh << 'EOF'
+#!/bin/bash
+
+# Sync repositories - check for changes before pulling
+
+set -e
+
+log_info() {
+    echo -e "\033[0;34m[INFO]\033[0m $1"
+}
+
+log_success() {
+    echo -e "\033[0;32m[SUCCESS]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+log_warning() {
+    echo -e "\033[1;33m[WARNING]\033[0m $1"
+}
+
+# Minimal get_default_branch for standalone script
+get_default_branch() {
+    local repo_url="$1"
+    local org_repo=""
+    if [[ "$repo_url" == git@github.com:* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|git@github.com:||' | sed 's|\.git$||')
+    elif [[ "$repo_url" == https://github.com/* ]]; then
+        org_repo=$(echo "$repo_url" | sed 's|https://github.com/||' | sed 's|\.git$||')
+    else
+        return 1
+    fi
+    local org_name=$(echo "$org_repo" | cut -d'/' -f1)
+    local global_repos_file="$HOME/.git-manage/$org_name/repos.txt"
+    if [ -f "$global_repos_file" ]; then
+        local cached_branch=$(grep -F "$repo_url" "$global_repos_file" | cut -f2 2>/dev/null || echo "")
+        if [ -n "$cached_branch" ]; then
+            echo "$cached_branch"
+            return 0
+        fi
+    fi
+    # Fallback to local detection
+    if git show-ref --verify --quiet refs/heads/main; then
+        echo "main"
+        return 0
+    elif git show-ref --verify --quiet refs/heads/master; then
+        echo "master"
+        return 0
+    else
+        git branch --show-current 2>/dev/null || echo ""
+        return 1
+    fi
+}
+
+if [ ! -f "repos.txt" ]; then
+    log_error "repos.txt not found in current directory"
+    exit 1
+fi
+
+log_info "Syncing repositories..."
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    
+    repo_url="$line"
+    repo_name=$(basename "$repo_url" .git)
+    
+    if [ ! -d "$repo_name" ]; then
+        log_warning "Repository '$repo_name' directory not found, skipping..."
+        continue
+    fi
+    
+    log_info "Syncing $repo_name..."
+    cd "$repo_name"
+    
+    # Check if it's a git repository
+    if [ ! -d ".git" ]; then
+        log_warning "$repo_name is not a git repository, skipping..."
+        cd ..
+        continue
+    fi
+    
+    # Get current branch
+    current_branch=$(git branch --show-current)
+    
+    # Get default branch
+    default_branch=$(get_default_branch "$repo_url")
+    if [ -z "$default_branch" ]; then
+        log_warning "Could not determine default branch for $repo_name, staying on current branch"
+        default_branch="$current_branch"
+    elif [ "$default_branch" != "$current_branch" ]; then
+        log_info "Default branch for $repo_name is: $default_branch"
+    fi
+    
+    # Switch to default branch if not already there
+    if [ "$current_branch" != "$default_branch" ]; then
+        log_info "Switching to $default_branch branch..."
+        git checkout "$default_branch" || {
+            log_warning "Failed to checkout $default_branch, staying on $current_branch"
+            default_branch="$current_branch"
+        }
+    fi
+    
+    # Check if there are local changes
+    if ! git diff-index --quiet HEAD --; then
+        log_warning "$repo_name has local changes, skipping sync"
+        cd ..
+        continue
+    fi
+    
+    # Check if there are untracked files
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        log_warning "$repo_name has untracked files, skipping sync"
+        cd ..
+        continue
+    fi
+    
+    # Check if we're behind remote
+    git fetch origin "$default_branch" > /dev/null 2>&1
+    local_behind=$(git rev-list HEAD..origin/"$default_branch" --count 2>/dev/null || echo "0")
+    
+    if [ "$local_behind" -gt 0 ]; then
+        log_info "Pulling $local_behind commits from remote..."
+        if git pull origin "$default_branch"; then
+            log_success "Successfully synced $repo_name"
+        else
+            log_error "Failed to sync $repo_name"
+        fi
+    else
+        log_info "$repo_name is already up to date"
+    fi
+    
+    cd ..
+done < repos.txt
+
+log_success "Repository sync completed"
+EOF
+        chmod +x sync_repos.sh
+        log_success "✅ Created sync_repos.sh"
+    fi
+    
+    log_success "🎉 Workspace upgraded successfully!"
+    echo
+    log_info "🚀 New commands available:"
+    echo "   git-manage sync              # Sync repos (check before pull)"
+    echo "   git-manage reset             # Reset repos to base branches"
+    echo "   ./sync_repos.sh              # Direct script execution"
+    echo "   ./reset_repos.sh             # Direct script execution"
+}
+
+# Update repositories in workspace
+update_repos() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace"
+        exit 1
+    fi
+    
+    log_info "Updating repositories in current workspace"
+    ./update_repos.sh
+}
+
+# Setup cron job for workspace  
+setup_cron() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        exit 1
+    fi
+    
+    log_info "Setting up cron job for current workspace"
+    ./setup_cron.sh
+}
+
+# Import all repositories from GitHub organization
+import_org() {
+    # Load default organizations
+    load_default_orgs
+    
+    local org_name="$1"
+    
+    # If no org specified, use first default org or show error
+    if [ -z "$org_name" ]; then
+        if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            org_name="${DEFAULT_ORGS[0]}"
+            log_info "No organization specified, using first default: $org_name"
+        else
+            log_error "No organization specified and no default organizations set"
+            log_info "Use 'git-manage import-org <org-name>' or set default organizations"
+            exit 1
+        fi
+    fi
+    
+    check_dependencies gh
+    check_gh_auth
+    
+    log_info "Importing repository list from organization: $org_name"
+    
+    # Initialize global org config
+    init_global_org_config "$org_name"
+    
+    # Get all repositories from the organization
+    log_info "Fetching repository list from GitHub..."
+    local temp_repos=$(mktemp)
+    local global_repos_file=$(get_global_org_repos "$org_name")
+    
+    if ! gh repo list "$org_name" --limit 1000 --json sshUrl -q '.[].sshUrl' > "$temp_repos"; then
+        log_error "Failed to fetch repositories from organization '$org_name'"
+        rm -f "$temp_repos"
+        exit 1
+    fi
+    
+    if [ ! -s "$temp_repos" ]; then
+        log_warning "No repositories found in organization '$org_name'"
+        rm -f "$temp_repos"
+        exit 0
+    fi
+    
+    log_info "Fetching default branches for each repository..."
+    
+    # Always delete the old repos.txt before writing the new one
+    if [ -f "$global_repos_file" ]; then
+        log_info "Deleting old $global_repos_file before writing new cache."
+        rm -f "$global_repos_file"
+    fi
+    
+    # Write header to repos.txt
+    {
+        echo "# $org_name organization repositories"
+        echo "# This file contains all available repositories for autocomplete and discovery"
+        echo "# Format: git@github.com:org/repo.git<TAB>default_branch"
+        echo "# Auto-populated by 'git-manage import-org $org_name'"
+        echo ""
+    } > "$global_repos_file"
+    
+    local total_repos=$(wc -l < "$temp_repos")
+    local current=0
+    local success_count=0
+    local fail_count=0
+    
+    while IFS= read -r repo_url; do
+        # Skip empty lines and comments
+        [[ -z "$repo_url" || "$repo_url" =~ ^[[:space:]]*# ]] && continue
+        current=$((current + 1))
+        local repo_name=$(basename "$repo_url" .git)
+        
+        # Show progress for large repositories
+        if [ "$total_repos" -gt 50 ]; then
+            if [ $((current % 10)) -eq 0 ]; then
+                log_info "[$current/$total_repos] Processing repositories..."
+            fi
+        fi
+        
+        local default_branch=""
+        default_branch=$(get_default_branch "$repo_url" "$repo_name" || true)
+        if [ -n "$default_branch" ]; then
+            echo -e "$repo_url\t$default_branch" >> "$global_repos_file" || true
+            success_count=$((success_count + 1))
+        else
+            echo "$repo_url" >> "$global_repos_file" || true
+            fail_count=$((fail_count + 1))
+        fi
+    done < "$temp_repos"
+    
+    log_info "Default branch fetch completed: $success_count success, $fail_count failed"
+    
+    rm -f "$temp_repos"
+    
+    local repo_count=$(cat "$global_repos_file" | grep -v '^#' | grep -v '^[[:space:]]*$' | wc -l | xargs)
+    log_success "Successfully imported $repo_count repositories from organization '$org_name'"
+    echo
+    log_info "📋 Global repository list cached: $global_repos_file"
+    log_info "🚀 Available commands:"
+    echo "   git-manage clone              # Interactive picker to select & clone"
+    echo "   git-manage clone repo-name    # Clone specific repository from $org_name"
+    echo "   git-manage create workspace   # Create workspace for organized management"
+    echo
+    log_info "💡 Repository list cached globally for fast access & autocomplete"
+}
+
+# List all imported organizations
+list_orgs() {
+    local global_dir=$(get_global_dir)
+    
+    if [ ! -d "$global_dir" ]; then
+        log_info "No organizations imported yet"
+        echo
+        log_info "💡 Run 'git-manage import-org <org-name>' to import an organization"
+        return
+    fi
+    
+    local orgs=$(get_imported_orgs)
+    if [ -z "$orgs" ]; then
+        log_info "No organizations imported yet"
+        echo
+        log_info "💡 Run 'git-manage import-org <org-name>' to import an organization"
+        return
+    fi
+    
+    log_info "📋 Imported Organizations:"
+    echo
+    
+    local total_repos=0
+    while IFS= read -r org; do
+        [ -z "$org" ] && continue
+        local repo_count=$(count_org_repos "$org")
+        local org_dir=$(get_global_org_dir "$org")
+        local last_updated=""
+        
+        if [ -f "$(get_global_org_repos "$org")" ]; then
+            last_updated=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$(get_global_org_repos "$org")" 2>/dev/null || echo "unknown")
+        fi
+        
+        printf "   %-20s %3d repos   (updated: %s)\n" "$org" "$repo_count" "$last_updated"
+        total_repos=$((total_repos + repo_count))
+    done <<< "$orgs"
+    
+    echo
+    log_info "📊 Total: $(echo "$orgs" | wc -l | xargs) organizations, $total_repos repositories"
+    echo
+    log_info "🚀 Available commands:"
+    echo "   git-manage refresh-orgs       # Refresh all organization lists"
+    echo "   git-manage setup-org-cron     # Setup automatic daily refresh"
+    echo "   git-manage clone              # Interactive repository picker"
+}
+
+# Refresh all imported organizations
+refresh_orgs() {
+    check_dependencies gh
+    
+    local orgs=$(get_imported_orgs)
+    if [ -z "$orgs" ]; then
+        log_info "No organizations to refresh"
+        echo
+        log_info "💡 Run 'git-manage import-org <org-name>' to import an organization first"
+        return
+    fi
+    
+    log_info "🔄 Refreshing all imported organizations..."
+    echo
+    
+    local success_count=0
+    local fail_count=0
+    local total_orgs=$(echo "$orgs" | wc -l | xargs)
+    local current=0
+    
+    while IFS= read -r org; do
+        [ -z "$org" ] && continue
+        current=$((current + 1))
+        
+        log_info "[$current/$total_orgs] Refreshing $org..."
+        
+        # Get repositories from GitHub
+        local temp_repos=$(mktemp)
+        local global_repos_file=$(get_global_org_repos "$org")
+        
+        if gh repo list "$org" --limit 1000 --json sshUrl -q '.[].sshUrl' > "$temp_repos" 2>/dev/null; then
+            # Fetch default branches for each repository
+            local temp_repos_with_branch=$(mktemp)
+            while IFS= read -r repo_url; do
+                # Skip empty lines and comments
+                [[ -z "$repo_url" || "$repo_url" =~ ^[[:space:]]*# ]] && continue
+                local repo_name=$(basename "$repo_url" .git)
+                local default_branch=""
+                default_branch=$(get_default_branch "$repo_url" "$repo_name" || true)
+                if [ -n "$default_branch" ]; then
+                    echo -e "$repo_url\t$default_branch" >> "$temp_repos_with_branch" || true
+                    success_count=$((success_count + 1))
+                else
+                    echo "$repo_url" >> "$temp_repos_with_branch" || true
+                    fail_count=$((fail_count + 1))
+                fi
+            done < "$temp_repos"
+            
+            # Update the repos file
+            {
+                cat "$global_repos_file" 2>/dev/null | head -5  # Keep header
+                cat "$temp_repos_with_branch"
+            } | grep -v '^#' | grep -v '^[[:space:]]*$' | sort -u > "$global_repos_file.tmp"
+            
+            # Add header back
+            {
+                echo "# $org organization repositories"
+                echo "# This file contains all available repositories for autocomplete and discovery"
+                echo "# Format: git@github.com:org/repo.git<TAB>default_branch"
+                echo "# Auto-populated by 'git-manage import-org $org'"
+                echo ""
+                cat "$global_repos_file.tmp"
+            } > "$global_repos_file"
+            
+            rm -f "$global_repos_file.tmp" "$temp_repos_with_branch"
+            
+            local repo_count=$(count_org_repos "$org")
+            log_success "✅ $org: $repo_count repositories"
+            success_count=$((success_count + 1))
+        else
+            log_error "❌ Failed to refresh $org"
+            fail_count=$((fail_count + 1))
+        fi
+        
+        rm -f "$temp_repos"
+    done <<< "$orgs"
+    
+    echo
+    if [ $fail_count -eq 0 ]; then
+        log_success "🎉 Successfully refreshed all $success_count organizations!"
+    else
+        log_warning "⚠️  Refreshed $success_count/$total_orgs organizations ($fail_count failed)"
+    fi
+}
+
+# Setup cron job for automatic organization refresh
+setup_org_cron() {
+    local global_dir=$(get_global_dir)
+    
+    # Check if we have any organizations to refresh
+    local orgs=$(get_imported_orgs)
+    if [ -z "$orgs" ]; then
+        log_error "No organizations imported yet"
+        log_info "💡 Run 'git-manage import-org <org-name>' to import organizations first"
+        exit 1
+    fi
+    
+    # Use installed script path or fallback to current script
+    local script_path=$(which git-manage 2>/dev/null || echo "$(realpath "${BASH_SOURCE[0]}")")
+    local log_file="$global_dir/refresh.log"
+    
+    log_info "Setting up automatic organization refresh..."
+    
+    # Create multiple cron job entries for laptop-friendly times
+    local cron_entries=(
+        "0 9 * * 1-5 $script_path refresh-orgs >> \"$log_file\" 2>&1"   # 9 AM on weekdays
+        "0 13 * * * $script_path refresh-orgs >> \"$log_file\" 2>&1"    # 1 PM daily  
+        "0 18 * * 1-5 $script_path refresh-orgs >> \"$log_file\" 2>&1"  # 6 PM on weekdays
+    )
+    
+    # Check if cron jobs already exist
+    if crontab -l 2>/dev/null | grep -Fq "git-manage refresh-orgs"; then
+        log_info "✅ Organization refresh cron jobs already exist"
+        log_info "📝 Current jobs refresh when laptop is likely to be on"
+        log_info "📋 Logs saved to: $log_file"
+        return 0
+    fi
+    
+    # Add cron jobs
+    local current_cron=$(crontab -l 2>/dev/null || true)
+    {
+        echo "$current_cron"
+        for entry in "${cron_entries[@]}"; do
+            echo "$entry"
+        done
+    } | crontab -
+    
+    log_success "✅ Successfully setup automatic organization refresh!"
+    echo
+    log_info "📅 Schedule: Multiple times when laptop is likely on:"
+    echo "     • 9:00 AM (weekdays) - Morning startup"
+    echo "     • 1:00 PM (daily)    - Lunch break" 
+    echo "     • 6:00 PM (weekdays) - End of workday"
+    log_info "📝 Logs: $log_file"
+    log_info "🔄 Organizations to refresh:"
+    
+    while IFS= read -r org; do
+        [ -z "$org" ] && continue
+        local repo_count=$(count_org_repos "$org")
+        echo "     • $org ($repo_count repos)"
+    done <<< "$orgs"
+    
+    echo
+    log_info "💡 Manual refresh: git-manage refresh-orgs"
+    log_info "🔍 View cron jobs: crontab -l"
+}
+
+# Reset repositories to base branches (discard local changes)
+reset_repos() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace"
+        exit 1
+    fi
+    
+    # Auto-upgrade if reset_repos.sh is missing
+    if [ ! -f "reset_repos.sh" ]; then
+        log_info "🔄 Auto-upgrading workspace to add reset functionality..."
+        upgrade_workspace
+    fi
+    
+    log_info "Resetting repositories to base branches..."
+    
+    if [ ! -f "repos.txt" ]; then
+        log_error "repos.txt not found in current directory"
+        exit 1
+    fi
+    
+    # Confirm action
+    echo
+    log_warning "⚠️  This will discard all local changes in all repositories!"
+    read -p "Are you sure you want to reset all repositories? (y/N): " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Reset cancelled"
+        exit 0
+    fi
+    
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        repo_url="$line"
+        repo_name=$(basename "$repo_url" .git)
+        
+        if [ ! -d "$repo_name" ]; then
+            log_warning "Repository '$repo_name' directory not found, skipping..."
+            continue
+        fi
+        
+        log_info "Resetting $repo_name..."
+        cd "$repo_name"
+        
+        # Check if it's a git repository
+        if [ ! -d ".git" ]; then
+            log_warning "$repo_name is not a git repository, skipping..."
+            cd ..
+            continue
+        fi
+        
+        # Get current branch
+        current_branch=$(git branch --show-current)
+        
+        # Get default branch from GitHub API or fallback to local detection
+        default_branch=$(get_default_branch "$repo_url" "$repo_name")
+        if [ -z "$default_branch" ]; then
+            log_warning "Could not determine default branch for $repo_name, staying on current branch"
+            default_branch="$current_branch"
+        elif [ "$default_branch" != "$current_branch" ]; then
+            log_info "Default branch for $repo_name is: $default_branch"
+        fi
+        
+        # Reset to base branch
+        if [ "$current_branch" != "$default_branch" ]; then
+            log_info "Switching to $default_branch branch..."
+            git checkout "$default_branch" || {
+                log_warning "Failed to checkout $default_branch, staying on $current_branch"
+                default_branch="$current_branch"
+            }
+        fi
+        
+        # Reset all changes
+        if git reset --hard HEAD && git clean -fd; then
+            log_success "Successfully reset $repo_name"
+        else
+            log_error "Failed to reset $repo_name"
+        fi
+        
+        cd ..
+    done < repos.txt
+    
+    log_success "Repository reset completed"
+}
+
+# Sync repositories (check for changes before pulling)
+sync_repos() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace"
+        exit 1
+    fi
+    
+    # Auto-upgrade if sync_repos.sh is missing
+    if [ ! -f "sync_repos.sh" ]; then
+        log_info "🔄 Auto-upgrading workspace to add sync functionality..."
+        upgrade_workspace
+    fi
+    
+    log_info "Syncing repositories..."
+    
+    if [ ! -f "repos.txt" ]; then
+        log_error "repos.txt not found in current directory"
+        exit 1
+    fi
+    
+    while IFS= read -r line; do
+        # Skip empty lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        
+        repo_url="$line"
+        repo_name=$(basename "$repo_url" .git)
+        
+        if [ ! -d "$repo_name" ]; then
+            log_warning "Repository '$repo_name' directory not found, skipping..."
+            continue
+        fi
+        
+        log_info "Syncing $repo_name..."
+        cd "$repo_name"
+        
+        # Check if it's a git repository
+        if [ ! -d ".git" ]; then
+            log_warning "$repo_name is not a git repository, skipping..."
+            cd ..
+            continue
+        fi
+        
+        # Get current branch
+        current_branch=$(git branch --show-current)
+        
+        # Get default branch from GitHub API or fallback to local detection
+        default_branch=$(get_default_branch "$repo_url" "$repo_name")
+        if [ -z "$default_branch" ]; then
+            log_warning "Could not determine default branch for $repo_name, staying on current branch"
+            default_branch="$current_branch"
+        elif [ "$default_branch" != "$current_branch" ]; then
+            log_info "Default branch for $repo_name is: $default_branch"
+        fi
+        
+        # Switch to default branch if not already there
+        if [ "$current_branch" != "$default_branch" ]; then
+            log_info "Switching to $default_branch branch..."
+            git checkout "$default_branch" || {
+                log_warning "Failed to checkout $default_branch, staying on $current_branch"
+                default_branch="$current_branch"
+            }
+        fi
+        
+        # Check if there are local changes
+        if ! git diff-index --quiet HEAD --; then
+            log_warning "$repo_name has local changes, skipping sync"
+            cd ..
+            continue
+        fi
+        
+        # Check if there are untracked files
+        if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+            log_warning "$repo_name has untracked files, skipping sync"
+            cd ..
+            continue
+        fi
+        
+        # Check if we're behind remote
+        git fetch origin "$default_branch" > /dev/null 2>&1
+        local_behind=$(git rev-list HEAD..origin/"$default_branch" --count 2>/dev/null || echo "0")
+        
+        if [ "$local_behind" -gt 0 ]; then
+            log_info "Pulling $local_behind commits from remote..."
+            if git pull origin "$default_branch"; then
+                log_success "Successfully synced $repo_name"
+            else
+                log_error "Failed to sync $repo_name"
+            fi
+        else
+            log_info "$repo_name is already up to date"
+        fi
+        
+        cd ..
+    done < repos.txt
+    
+    log_success "Repository sync completed"
+}
+
+# Reset repositories to base branches and then sync them
+reset_and_sync() {
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace"
+        exit 1
+    fi
+    
+    # Auto-upgrade if reset_repos.sh or sync_repos.sh is missing
+    if [ ! -f "reset_repos.sh" ] || [ ! -f "sync_repos.sh" ]; then
+        log_info "🔄 Auto-upgrading workspace to add reset-and-sync functionality..."
+        upgrade_workspace
+    fi
+    
+    log_info "Resetting repositories to base branches and then syncing..."
+    
+    # Confirm action
+    echo
+    log_warning "⚠️  This will discard all local changes and then sync with remote!"
+    read -p "Are you sure you want to reset and sync all repositories? (y/N): " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Reset and sync cancelled"
+        exit 0
+    fi
+    
+    # First reset all repositories
+    log_info "Step 1: Resetting repositories..."
+    reset_repos
+    
+    # Then sync all repositories
+    log_info "Step 2: Syncing repositories..."
+    sync_repos
+    
+    log_success "Reset and sync completed successfully"
+}
+
+# Select repositories interactively using fzf
+select_repos() {
+    # Load default organizations
+    load_default_orgs
+    
+    local org_name="$1"
+    
+    # If no org specified, use first default org or show error
+    if [ -z "$org_name" ]; then
+        if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            org_name="${DEFAULT_ORGS[0]}"
+            log_info "No organization specified, using first default: $org_name"
+        else
+            log_error "No organization specified and no default organizations set"
+            log_info "Use 'git-manage select-repos <org-name>' or set default organizations"
+            exit 1
+        fi
+    fi
+    
+    if ! is_workspace; then
+        log_error "Not in a workspace directory"
+        log_info "Use 'git-manage create <name>' to create a workspace first"
+        exit 1
+    fi
+    
+    check_dependencies gh fzf
+    
+    log_info "Interactive repository selection from organization: $org_name"
+    
+    # Get repositories with details for fzf
+    log_info "Fetching repository list from GitHub..."
+    local temp_repos=$(mktemp)
+    local temp_selected=$(mktemp)
+    
+    if ! gh repo list "$org_name" --limit 1000 --json name,description,sshUrl -q '.[] | "\(.name)\t\(.description // "No description")\t\(.sshUrl)"' > "$temp_repos"; then
+        log_error "Failed to fetch repositories from organization '$org_name'"
+        rm -f "$temp_repos" "$temp_selected"
+        exit 1
+    fi
+    
+    if [ ! -s "$temp_repos" ]; then
+        log_warning "No repositories found in organization '$org_name'"
+        rm -f "$temp_repos" "$temp_selected"
+        exit 0
+    fi
+    
+    # Use fzf for interactive selection
+    log_info "Use Tab to select/deselect repositories, Enter to confirm selection"
+    if ! cat "$temp_repos" | fzf -m \
+        --header="Select repositories (Tab to select/deselect, Enter to confirm)" \
+        --preview="echo 'SSH URL: {3}'" \
+        --delimiter='\t' \
+        --with-nth=1,2 \
+        --bind="tab:toggle" > "$temp_selected"; then
+        log_info "Selection cancelled"
+        rm -f "$temp_repos" "$temp_selected"
+        exit 0
+    fi
+    
+    if [ ! -s "$temp_selected" ]; then
+        log_info "No repositories selected"
+        rm -f "$temp_repos" "$temp_selected"
+        exit 0
+    fi
+    
+    # Extract SSH URLs from selected repositories
+    local selected_ssh_urls=$(mktemp)
+    cut -f3 "$temp_selected" > "$selected_ssh_urls"
+    
+    # Add selected repositories to repos.txt (avoiding duplicates)
+    log_info "Adding selected repositories to repos.txt..."
+    {
+        cat repos.txt 2>/dev/null || true
+        cat "$selected_ssh_urls"
+    } | grep -v '^#' | grep -v '^[[:space:]]*$' | cut -f1 | sort -u > repos.txt.tmp
+    
+    # Add header back
+    {
+        echo "# Git repositories list"
+        echo "# Add one repository URL per line"
+        echo "# Lines starting with # are comments and will be ignored"
+        echo "# Example: git@github.com:user/repo.git"
+        echo ""
+        cat repos.txt.tmp
+    } > repos.txt
+    
+    rm -f repos.txt.tmp "$selected_ssh_urls"
+    
+    # Show selected repositories
+    local selected_count=$(wc -l < "$temp_selected")
+    log_success "Selected $selected_count repositories:"
+    while IFS=$'\t' read -r name desc ssh_url; do
+        log_info "  - $name"
+    done < "$temp_selected"
+    
+    rm -f "$temp_repos" "$temp_selected"
+    
+    # Clone repositories
+    log_info "Cloning selected repositories..."
+    ./clone_repos.sh
+    
+    log_success "Successfully added and cloned selected repositories"
+}
+
+# Configure default organizations
+config_orgs() {
+    # Load current default organizations
+    load_default_orgs
+    
+    echo
+    log_info "🔧 Configure Default Organizations"
+    echo
+    
+    if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+        log_info "Current default organizations: ${DEFAULT_ORGS[*]}"
+    else
+        log_info "No default organizations currently set"
+    fi
+    
+    echo
+    log_info "Enter new default organizations (comma-separated)"
+    log_info "Examples: rudderlabs,microsoft,facebook"
+    log_info "Press Enter to keep current settings, or 'clear' to remove all"
+    echo
+    
+    local default_orgs_input=""
+    read -p "Default organizations: " default_orgs_input
+    
+    if [ -z "$default_orgs_input" ]; then
+        log_info "Keeping current default organizations"
+        return 0
+    fi
+    
+    if [ "$default_orgs_input" = "clear" ]; then
+        DEFAULT_ORGS=()
+        log_info "Clearing all default organizations"
+    else
+        # Parse comma-separated organizations
+        IFS=',' read -ra org_array <<< "$default_orgs_input"
+        DEFAULT_ORGS=()
+        
+        for org in "${org_array[@]}"; do
+            # Trim whitespace
+            org=$(echo "$org" | xargs)
+            if [ -n "$org" ]; then
+                DEFAULT_ORGS+=("$org")
+            fi
+        done
+        
+        if [ ${#DEFAULT_ORGS[@]} -gt 0 ]; then
+            log_info "New default organizations: ${DEFAULT_ORGS[*]}"
+        fi
+    fi
+    
+    # Save the configuration
+    save_default_orgs
+    
+    echo
+    log_success "✅ Default organizations updated successfully!"
+    log_info "🚀 These organizations will be used for:"
+    echo "   • Autocomplete in clone commands"
+    echo "   • Default org when none specified"
+    echo "   • Interactive repository picker"
+    echo
+    log_info "💡 You can change this anytime with: git-manage config-orgs"
+}
+
+# Main command dispatcher
+main() {
+    # Load default organizations at startup
+    load_default_orgs
+    
+    if [ $# -eq 0 ]; then
+        show_usage
+        exit 1
+    fi
+    
+    local command="$1"
+    shift
+    
+    case "$command" in
+        install)
+            install_to_path "$@"
+            ;;
+        create)
+            create_workspace "$@"
+            ;;
+        clone)
+            clone_repos "$@"
+            ;;
+        update)
+            update_repos "$@"
+            ;;
+        sync)
+            sync_repos "$@"
+            ;;
+        reset)
+            reset_repos "$@"
+            ;;
+        reset-and-sync)
+            reset_and_sync "$@"
+            ;;
+        upgrade)
+            upgrade_workspace "$@"
+            ;;
+        setup-cron)
+            setup_cron "$@"
+            ;;
+        import-org)
+            import_org "$@"
+            ;;
+        list-orgs)
+            list_orgs "$@"
+            ;;
+        refresh-orgs)
+            refresh_orgs "$@"
+            ;;
+        setup-org-cron)
+            setup_org_cron "$@"
+            ;;
+        select-repos)
+            select_repos "$@"
+            ;;
+        config-orgs)
+            config_orgs "$@"
+            ;;
+        help|--help|-h)
+            show_usage
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+# Run main function with all arguments
+main "$@" 
